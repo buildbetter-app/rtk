@@ -1,4 +1,7 @@
+// Modified by BuildBetter: re-export the configurable hook rewrite prefix.
 //! Hook installation and lifecycle management for AI coding agents.
+
+pub use crate::discover::registry::RewritePrefix;
 
 pub mod constants;
 pub mod hook_audit_cmd;

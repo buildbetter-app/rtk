@@ -1,3 +1,4 @@
+// Modified by BuildBetter: expose pure payload processors and configurable rewrite prefixes.
 //! Processes incoming hook calls from AI agents and rewrites commands on the fly.
 //!
 //! Uses `writeln!(stdout, ...)` instead of `println!` — accidental stdout/stderr
@@ -9,7 +10,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::io::{self, Read, Write};
 
-use crate::discover::registry::{has_heredoc, rewrite_command};
+use crate::discover::registry::{has_heredoc, rewrite_command_with_prefix, RewritePrefix};
 
 const STDIN_CAP: usize = 1_048_576; // 1 MiB
 
@@ -231,8 +232,14 @@ fn heal_legacy_hook_file(path: &std::path::Path) -> bool {
         .is_ok()
 }
 
-fn get_rewritten(cmd: &str) -> Option<String> {
-    if has_heredoc(cmd) {
+/// Return the command rewrite produced by the same safety and configuration rules as hooks.
+pub fn rewrite_hook_command(cmd: &str) -> Option<String> {
+    rewrite_hook_command_with_prefix(cmd, &RewritePrefix::default())
+}
+
+/// Return the hook-equivalent command rewrite with a caller-provided executable prefix.
+pub fn rewrite_hook_command_with_prefix(cmd: &str, prefix: &RewritePrefix) -> Option<String> {
+    if has_heredoc(cmd) || crate::discover::lexer::contains_unattestable_construct(cmd) {
         return None;
     }
 
@@ -240,13 +247,18 @@ fn get_rewritten(cmd: &str) -> Option<String> {
         .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
         .unwrap_or_default();
 
-    let rewritten = rewrite_command(cmd, &excluded, &transparent_prefixes)?;
+    let rewritten = rewrite_command_with_prefix(cmd, &excluded, &transparent_prefixes, prefix)?;
 
     if rewritten == cmd {
         return None;
     }
 
     Some(rewritten)
+}
+
+#[cfg(test)]
+fn get_rewritten(cmd: &str) -> Option<String> {
+    rewrite_hook_command(cmd)
 }
 
 enum HookDecision {
@@ -256,14 +268,20 @@ enum HookDecision {
     Deny,
 }
 
+#[cfg(test)]
 fn decide_from_verdict(cmd: &str, verdict: PermissionVerdict) -> HookDecision {
+    decide_from_verdict_with_prefix(cmd, verdict, &RewritePrefix::default())
+}
+
+fn decide_from_verdict_with_prefix(
+    cmd: &str,
+    verdict: PermissionVerdict,
+    prefix: &RewritePrefix,
+) -> HookDecision {
     if verdict == PermissionVerdict::Deny {
         return HookDecision::Deny;
     }
-    if crate::discover::lexer::contains_unattestable_construct(cmd) {
-        return HookDecision::Defer;
-    }
-    match get_rewritten(cmd) {
+    match rewrite_hook_command_with_prefix(cmd, prefix) {
         Some(r) if verdict == PermissionVerdict::Allow => HookDecision::AllowRewrite(r),
         Some(r) => HookDecision::AskRewrite(r),
         None => HookDecision::Defer,
@@ -271,7 +289,15 @@ fn decide_from_verdict(cmd: &str, verdict: PermissionVerdict) -> HookDecision {
 }
 
 fn decide_hook_action(cmd: &str, host: permissions::Host) -> HookDecision {
-    decide_from_verdict(cmd, permissions::check_command_for(cmd, host))
+    decide_hook_action_with_prefix(cmd, host, &RewritePrefix::default())
+}
+
+fn decide_hook_action_with_prefix(
+    cmd: &str,
+    host: permissions::Host,
+    prefix: &RewritePrefix,
+) -> HookDecision {
+    decide_from_verdict_with_prefix(cmd, permissions::check_command_for(cmd, host), prefix)
 }
 
 fn handle_vscode(cmd: &str) -> Result<()> {
@@ -558,7 +584,8 @@ fn audit_log_inner(action: &str, original: &str, rewritten: &str) -> Option<()> 
 
 // ── Claude Code native hook ────────────────────────────────────
 
-enum PayloadAction {
+#[derive(Clone, Debug, PartialEq)]
+pub enum PayloadAction {
     Rewrite {
         cmd: String,
         rewritten: String,
@@ -571,7 +598,13 @@ enum PayloadAction {
     Ignore,
 }
 
-fn process_claude_payload(v: &Value) -> PayloadAction {
+/// Process a Claude Code PreToolUse payload without reading stdin or printing output.
+pub fn process_claude_payload(v: &Value) -> PayloadAction {
+    process_claude_payload_with_prefix(v, &RewritePrefix::default())
+}
+
+/// Process a Claude Code PreToolUse payload with a caller-provided executable prefix.
+pub fn process_claude_payload_with_prefix(v: &Value, prefix: &RewritePrefix) -> PayloadAction {
     let cmd = match v
         .pointer("/tool_input/command")
         .and_then(|c| c.as_str())
@@ -581,22 +614,23 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
         None => return PayloadAction::Ignore,
     };
 
-    let (rewritten, allow) = match decide_hook_action(cmd, permissions::Host::Claude) {
-        HookDecision::Deny => {
-            return PayloadAction::Skip {
-                reason: "skip:deny_rule",
-                cmd: cmd.to_string(),
+    let (rewritten, allow) =
+        match decide_hook_action_with_prefix(cmd, permissions::Host::Claude, prefix) {
+            HookDecision::Deny => {
+                return PayloadAction::Skip {
+                    reason: "skip:deny_rule",
+                    cmd: cmd.to_string(),
+                }
             }
-        }
-        HookDecision::Defer => {
-            return PayloadAction::Skip {
-                reason: "skip:defer",
-                cmd: cmd.to_string(),
+            HookDecision::Defer => {
+                return PayloadAction::Skip {
+                    reason: "skip:defer",
+                    cmd: cmd.to_string(),
+                }
             }
-        }
-        HookDecision::AllowRewrite(r) => (r, true),
-        HookDecision::AskRewrite(r) => (r, false),
-    };
+            HookDecision::AllowRewrite(r) => (r, true),
+            HookDecision::AskRewrite(r) => (r, false),
+        };
 
     let updated_input = {
         let mut ti = v.get("tool_input").cloned().unwrap_or_else(|| json!({}));
@@ -702,54 +736,100 @@ pub fn run_cursor() -> Result<()> {
         }
     };
 
-    let cmd = match v
-        .pointer("/tool_input/command")
-        .and_then(|c| c.as_str())
-        .filter(|c| !c.is_empty())
-    {
-        Some(c) => c.to_string(),
-        None => {
-            let _ = writeln!(io::stdout(), "{{}}");
-            return Ok(());
+    let output = match process_cursor_payload(&v) {
+        PayloadAction::Rewrite {
+            cmd,
+            rewritten,
+            output,
+        } => {
+            let action = if output.get("permission").and_then(Value::as_str) == Some("allow") {
+                "rewrite"
+            } else {
+                "ask"
+            };
+            audit_log(action, &cmd, &rewritten);
+            output.to_string()
         }
-    };
-
-    let output = match decide_hook_action(&cmd, permissions::Host::Cursor) {
-        HookDecision::AllowRewrite(rewritten) => {
-            audit_log("rewrite", &cmd, &rewritten);
-            cursor_allow(&rewritten)
-        }
-        HookDecision::AskRewrite(rewritten) => {
-            audit_log("ask", &cmd, &rewritten);
-            cursor_ask(&rewritten)
-        }
-        other => {
-            if matches!(other, HookDecision::Deny) {
+        PayloadAction::Skip { reason, cmd } => {
+            if reason == "skip:deny_rule" {
                 audit_log("deny", &cmd, "");
             }
             "{}".to_string()
         }
+        PayloadAction::Ignore => "{}".to_string(),
     };
     let _ = writeln!(io::stdout(), "{output}");
     Ok(())
 }
 
-fn cursor_allow(rewritten: &str) -> String {
+/// Process a Cursor Agent payload without reading stdin or printing output.
+pub fn process_cursor_payload(v: &Value) -> PayloadAction {
+    process_cursor_payload_with_prefix(v, &RewritePrefix::default())
+}
+
+/// Process a Cursor Agent payload with a caller-provided executable prefix.
+pub fn process_cursor_payload_with_prefix(v: &Value, prefix: &RewritePrefix) -> PayloadAction {
+    let cmd = match v
+        .pointer("/tool_input/command")
+        .and_then(|c| c.as_str())
+        .filter(|c| !c.is_empty())
+    {
+        Some(c) => c,
+        None => return PayloadAction::Ignore,
+    };
+
+    match decide_hook_action_with_prefix(cmd, permissions::Host::Cursor, prefix) {
+        HookDecision::AllowRewrite(rewritten) => {
+            let output = cursor_allow_value(&rewritten);
+            PayloadAction::Rewrite {
+                cmd: cmd.to_string(),
+                rewritten,
+                output,
+            }
+        }
+        HookDecision::AskRewrite(rewritten) => {
+            let output = cursor_ask_value(&rewritten);
+            PayloadAction::Rewrite {
+                cmd: cmd.to_string(),
+                rewritten,
+                output,
+            }
+        }
+        HookDecision::Deny => PayloadAction::Skip {
+            reason: "skip:deny_rule",
+            cmd: cmd.to_string(),
+        },
+        HookDecision::Defer => PayloadAction::Skip {
+            reason: "skip:defer",
+            cmd: cmd.to_string(),
+        },
+    }
+}
+
+fn cursor_allow_value(rewritten: &str) -> Value {
     json!({
         "continue": true,
         "permission": "allow",
         "updated_input": { "command": rewritten }
     })
-    .to_string()
 }
 
-fn cursor_ask(rewritten: &str) -> String {
+fn cursor_ask_value(rewritten: &str) -> Value {
     json!({
         "continue": true,
         "permission": "ask",
         "updated_input": { "command": rewritten }
     })
-    .to_string()
+}
+
+#[cfg(test)]
+fn cursor_allow(rewritten: &str) -> String {
+    cursor_allow_value(rewritten).to_string()
+}
+
+#[cfg(test)]
+fn cursor_ask(rewritten: &str) -> String {
+    cursor_ask_value(rewritten).to_string()
 }
 
 #[cfg(test)]
@@ -1360,6 +1440,19 @@ mod tests {
     }
 
     #[test]
+    fn test_public_hook_rewrite_helper_supports_custom_prefix() {
+        let prefix = RewritePrefix::new("zs proxy").unwrap();
+        assert_eq!(
+            rewrite_hook_command_with_prefix("git status", &prefix),
+            Some("zs proxy git status".into())
+        );
+        assert_eq!(
+            rewrite_hook_command_with_prefix("git status $(whoami)", &prefix),
+            None
+        );
+    }
+
+    #[test]
     fn test_gemini_hook_excluded_commands() {
         let excluded = vec!["curl".to_string()];
         assert_eq!(
@@ -1411,6 +1504,23 @@ mod tests {
             .and_then(|c| c.as_str())
             .unwrap();
         assert_eq!(cmd, "rtk git status");
+    }
+
+    #[test]
+    fn test_claude_payload_processor_supports_custom_prefix() {
+        let input: Value = serde_json::from_str(&claude_input("git status")).unwrap();
+        let prefix = RewritePrefix::new("zs proxy").unwrap();
+        let PayloadAction::Rewrite {
+            rewritten, output, ..
+        } = process_claude_payload_with_prefix(&input, &prefix)
+        else {
+            panic!("expected Claude payload rewrite");
+        };
+        assert_eq!(rewritten, "zs proxy git status");
+        assert_eq!(
+            output["hookSpecificOutput"]["updatedInput"]["command"],
+            "zs proxy git status"
+        );
     }
 
     #[test]
@@ -1552,6 +1662,21 @@ mod tests {
         // `continue: true` keeps the Cursor preToolUse panel from collapsing
         // to `Output: {}`; without it the rewrite is invisible to users.
         assert_eq!(v["continue"], true);
+    }
+
+    #[test]
+    fn test_cursor_payload_processor_supports_custom_prefix() {
+        let input: Value = serde_json::from_str(&cursor_input("git status")).unwrap();
+        let prefix = RewritePrefix::new("zs proxy").unwrap();
+        let PayloadAction::Rewrite {
+            rewritten, output, ..
+        } = process_cursor_payload_with_prefix(&input, &prefix)
+        else {
+            panic!("expected Cursor payload rewrite");
+        };
+        assert_eq!(rewritten, "zs proxy git status");
+        assert_eq!(output["updated_input"]["command"], "zs proxy git status");
+        assert_eq!(output["permission"], "ask");
     }
 
     #[test]

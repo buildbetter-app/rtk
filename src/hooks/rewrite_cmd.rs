@@ -1,3 +1,4 @@
+// Modified by BuildBetter: expose pure rewrite APIs with a configurable executable prefix.
 //! Translates a raw shell command into its RTK-optimized equivalent.
 
 use super::permissions::{check_command, PermissionVerdict};
@@ -20,7 +21,12 @@ pub fn run(cmd: &str) -> anyhow::Result<()> {
         .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
         .unwrap_or_default();
 
-    match evaluate(cmd, &excluded, &transparent_prefixes) {
+    match evaluate_with_prefix(
+        cmd,
+        &excluded,
+        &transparent_prefixes,
+        &registry::RewritePrefix::default(),
+    ) {
         RewriteOutcome::Allow(rewritten) => {
             print!("{}", rewritten);
             let _ = std::io::stdout().flush();
@@ -36,6 +42,26 @@ pub fn run(cmd: &str) -> anyhow::Result<()> {
     }
 }
 
+/// Return the rewritten command without printing or exiting.
+///
+/// Both explicitly allowed rewrites and rewrites that require a host permission prompt
+/// return `Some`. Denied, unsafe, and unsupported commands return `None`.
+pub fn rewrite(cmd: &str) -> Option<String> {
+    rewrite_with_prefix(cmd, &registry::RewritePrefix::default())
+}
+
+/// Return the rewritten command using a caller-provided executable prefix.
+pub fn rewrite_with_prefix(cmd: &str, prefix: &registry::RewritePrefix) -> Option<String> {
+    let (excluded, transparent_prefixes) = crate::core::config::Config::load()
+        .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
+        .unwrap_or_default();
+
+    match evaluate_with_prefix(cmd, &excluded, &transparent_prefixes, prefix) {
+        RewriteOutcome::Allow(rewritten) | RewriteOutcome::Ask(rewritten) => Some(rewritten),
+        RewriteOutcome::Deny | RewriteOutcome::Passthrough => None,
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum RewriteOutcome {
     Allow(String),
@@ -44,8 +70,19 @@ enum RewriteOutcome {
     Ask(String),
 }
 
-fn evaluate(cmd: &str, excluded: &[String], transparent_prefixes: &[String]) -> RewriteOutcome {
-    evaluate_with_verdict(cmd, check_command(cmd), excluded, transparent_prefixes)
+fn evaluate_with_prefix(
+    cmd: &str,
+    excluded: &[String],
+    transparent_prefixes: &[String],
+    prefix: &registry::RewritePrefix,
+) -> RewriteOutcome {
+    evaluate_with_verdict_and_prefix(
+        cmd,
+        check_command(cmd),
+        excluded,
+        transparent_prefixes,
+        prefix,
+    )
 }
 
 /// Decision logic for [`evaluate`] with the permission verdict supplied by the
@@ -55,11 +92,28 @@ fn evaluate(cmd: &str, excluded: &[String], transparent_prefixes: &[String]) -> 
 /// call [`evaluate`] directly would change verdict with the developer's local
 /// `settings.local.json`. Taking the verdict as a parameter keeps the rewrite
 /// logic under test independent of the host configuration (#3146).
+#[cfg(test)]
 fn evaluate_with_verdict(
     cmd: &str,
     verdict: PermissionVerdict,
     excluded: &[String],
     transparent_prefixes: &[String],
+) -> RewriteOutcome {
+    evaluate_with_verdict_and_prefix(
+        cmd,
+        verdict,
+        excluded,
+        transparent_prefixes,
+        &registry::RewritePrefix::default(),
+    )
+}
+
+fn evaluate_with_verdict_and_prefix(
+    cmd: &str,
+    verdict: PermissionVerdict,
+    excluded: &[String],
+    transparent_prefixes: &[String],
+    prefix: &registry::RewritePrefix,
 ) -> RewriteOutcome {
     if verdict == PermissionVerdict::Deny {
         return RewriteOutcome::Deny;
@@ -69,7 +123,7 @@ fn evaluate_with_verdict(
         return RewriteOutcome::Passthrough;
     }
 
-    match registry::rewrite_command(cmd, excluded, transparent_prefixes) {
+    match registry::rewrite_command_with_prefix(cmd, excluded, transparent_prefixes, prefix) {
         Some(rewritten) => match verdict {
             PermissionVerdict::Allow => RewriteOutcome::Allow(rewritten),
             _ => RewriteOutcome::Ask(rewritten),
@@ -102,6 +156,20 @@ mod tests {
             rewrite_command_no_prefixes("rtk git status"),
             Some("rtk git status".into())
         );
+    }
+
+    #[test]
+    fn test_rewrite_with_custom_prefix_returns_command() {
+        let prefix = registry::RewritePrefix::new("zs proxy").unwrap();
+        assert_eq!(
+            rewrite_with_prefix("git status", &prefix),
+            Some("zs proxy git status".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_returns_none_for_unsupported_command() {
+        assert_eq!(rewrite("htop"), None);
     }
 
     /// The verdict still drives the outcome: an allow rule yields `Allow`.

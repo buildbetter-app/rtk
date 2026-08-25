@@ -1,3 +1,4 @@
+// Modified by BuildBetter: allow embedded executions to suppress SQLite tracking.
 //! Token savings tracking and analytics system.
 //!
 //! This module provides comprehensive tracking of RTK command executions,
@@ -33,6 +34,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -62,6 +64,41 @@ fn project_filter_params(project_path: Option<&str>) -> (Option<String>, Option<
 }
 
 use super::constants::{DEFAULT_HISTORY_DAYS, HISTORY_DB, RTK_DATA_DIR};
+
+thread_local! {
+    static TRACKING_DISABLED: Cell<usize> = const { Cell::new(0) };
+}
+
+struct TrackingDisabledGuard;
+
+impl TrackingDisabledGuard {
+    fn enter() -> Self {
+        TRACKING_DISABLED.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for TrackingDisabledGuard {
+    fn drop(&mut self) {
+        TRACKING_DISABLED.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+fn is_tracking_disabled() -> bool {
+    TRACKING_DISABLED.with(|depth| depth.get() > 0)
+}
+
+/// Run a closure without opening or writing RTK's SQLite tracking database.
+///
+/// The setting is scoped to the current thread and supports nesting, so
+/// independent embedded executions on other threads keep their own policy.
+pub fn without_tracking<F, T>(f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    let _guard = TrackingDisabledGuard::enter();
+    f()
+}
 
 /// Main tracking interface for recording and querying command history.
 ///
@@ -247,6 +284,9 @@ impl Tracker {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn new() -> Result<Self> {
+        if is_tracking_disabled() {
+            anyhow::bail!("RTK tracking is disabled for this execution");
+        }
         let db_path = get_db_path()?;
         if let Some(parent) = db_path.parent() {
             crate::core::utils::create_private_dir(parent)?;
@@ -1330,14 +1370,13 @@ pub fn estimate_tokens(text: &str) -> usize {
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```
 /// use rtk::tracking::TimedExecution;
 ///
 /// let timer = TimedExecution::start();
-/// let input = execute_standard_command()?;
-/// let output = execute_rtk_command()?;
-/// timer.track("ls -la", "rtk ls", &input, &output);
-/// # Ok::<(), anyhow::Error>(())
+/// let input = "long output";
+/// let output = "short output";
+/// timer.track("ls -la", "rtk ls", input, output);
 /// ```
 pub struct TimedExecution {
     start: Instant,
@@ -1458,6 +1497,11 @@ pub fn args_display(args: &[OsString]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn without_tracking_prevents_database_initialization() {
+        assert!(without_tracking(Tracker::new).is_err());
+    }
 
     // 1. estimate_tokens — verify ~4 chars/token ratio
     #[test]
