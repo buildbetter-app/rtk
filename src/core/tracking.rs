@@ -34,7 +34,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -67,6 +67,76 @@ use super::constants::{DEFAULT_HISTORY_DAYS, HISTORY_DB, RTK_DATA_DIR};
 
 thread_local! {
     static TRACKING_DISABLED: Cell<usize> = const { Cell::new(0) };
+    static OBSERVATION_STACK: RefCell<Vec<Vec<RunObservation>>> = const { RefCell::new(Vec::new()) };
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunObservation {
+    pub raw_bytes: usize,
+    pub filtered_bytes: usize,
+    pub filter_name: String,
+}
+
+struct ObservationGuard {
+    active: bool,
+}
+
+impl ObservationGuard {
+    fn enter() -> Self {
+        OBSERVATION_STACK.with(|stack| stack.borrow_mut().push(Vec::new()));
+        Self { active: true }
+    }
+
+    fn finish(mut self) -> Vec<RunObservation> {
+        self.active = false;
+        OBSERVATION_STACK.with(|stack| stack.borrow_mut().pop().unwrap_or_default())
+    }
+}
+
+impl Drop for ObservationGuard {
+    fn drop(&mut self) {
+        if self.active {
+            OBSERVATION_STACK.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+pub(crate) fn collect_observations<F, T>(run: F) -> (T, Vec<RunObservation>)
+where
+    F: FnOnce() -> T,
+{
+    let guard = ObservationGuard::enter();
+    let result = run();
+    let observations = guard.finish();
+    (result, observations)
+}
+
+fn filter_name_from_tracking_label(rtk_cmd: &str) -> String {
+    let mut parts = rtk_cmd.split_whitespace();
+    let first = parts.next().unwrap_or("unknown");
+    if first == "rtk" {
+        parts.next().unwrap_or("unknown").trim_end_matches(':')
+    } else {
+        first
+            .strip_prefix("rtk:")
+            .unwrap_or(first)
+            .trim_end_matches(':')
+    }
+    .to_string()
+}
+
+fn observe_run(rtk_cmd: &str, input: &str, output: &str) {
+    OBSERVATION_STACK.with(|stack| {
+        if let Some(observations) = stack.borrow_mut().last_mut() {
+            observations.push(RunObservation {
+                raw_bytes: input.len(),
+                filtered_bytes: output.len(),
+                filter_name: filter_name_from_tracking_label(rtk_cmd),
+            });
+        }
+    });
 }
 
 struct TrackingDisabledGuard;
@@ -1433,6 +1503,8 @@ impl TimedExecution {
         let input_tokens = estimate_tokens(input);
         let output_tokens = estimate_tokens(output);
 
+        observe_run(rtk_cmd, input, output);
+
         if let Ok(tracker) = Tracker::new() {
             let _ = tracker.record(
                 original_cmd,
@@ -1466,6 +1538,7 @@ impl TimedExecution {
     /// ```
     pub fn track_passthrough(&self, original_cmd: &str, rtk_cmd: &str) {
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        observe_run(rtk_cmd, "", "");
         // input_tokens=0, output_tokens=0 won't dilute savings statistics
         if let Ok(tracker) = Tracker::new() {
             let _ = tracker.record(original_cmd, rtk_cmd, 0, 0, elapsed_ms);
@@ -1497,6 +1570,29 @@ pub fn args_display(args: &[OsString]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collect_observations_uses_tracking_strings() {
+        let (_, observations) = collect_observations(|| {
+            without_tracking(|| {
+                TimedExecution::start().track(
+                    "git status --short",
+                    "rtk git status --short",
+                    "raw output",
+                    "short",
+                );
+            });
+        });
+
+        assert_eq!(
+            observations,
+            vec![RunObservation {
+                raw_bytes: 10,
+                filtered_bytes: 5,
+                filter_name: "git".to_string(),
+            }]
+        );
+    }
 
     #[test]
     fn without_tracking_prevents_database_initialization() {

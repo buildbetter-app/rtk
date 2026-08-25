@@ -1636,6 +1636,46 @@ impl Default for RunOptions {
 
 /// Execute one original command argv with embedding-specific options.
 pub fn run_filtered_with_options(argv: &[OsString], options: RunOptions) -> Result<i32> {
+    run_filtered_dispatch(argv, options)
+}
+
+/// Byte counts and filter identity for an embedded RTK execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunReport {
+    /// Exit code from the proxied command.
+    pub exit_code: i32,
+    /// Total bytes in the raw strings passed to RTK's savings tracker.
+    pub raw_bytes: usize,
+    /// Total bytes in the emitted strings passed to RTK's savings tracker.
+    pub filtered_bytes: usize,
+    /// RTK filter name, or `unknown` if the execution produced no observation.
+    pub filter_name: String,
+}
+
+/// Execute one original command argv and return the observed savings data.
+///
+/// The byte counts use the same input and output strings as RTK's internal
+/// savings tracker. Commands that use a passthrough path report zero bytes.
+pub fn run_filtered_with_report(argv: &[OsString], options: RunOptions) -> Result<RunReport> {
+    let (result, observations) =
+        core::tracking::collect_observations(|| run_filtered_dispatch(argv, options));
+    let exit_code = result?;
+    let raw_bytes = observations.iter().map(|item| item.raw_bytes).sum();
+    let filtered_bytes = observations.iter().map(|item| item.filtered_bytes).sum();
+    let filter_name = observations
+        .first()
+        .map(|item| item.filter_name.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Ok(RunReport {
+        exit_code,
+        raw_bytes,
+        filtered_bytes,
+        filter_name,
+    })
+}
+
+fn run_filtered_dispatch(argv: &[OsString], options: RunOptions) -> Result<i32> {
     let mut parse_args = Vec::with_capacity(argv.len() + 1);
     parse_args.push(OsString::from("rtk"));
     parse_args.extend_from_slice(argv);
@@ -3721,4 +3761,25 @@ fn embedded_unknown_command_uses_supplied_argv_without_tracking() {
     )
     .unwrap();
     assert_eq!(code, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn embedded_git_command_returns_run_report() {
+    let report = run_filtered_with_report(
+        &[
+            OsString::from("git"),
+            OsString::from("status"),
+            OsString::from("--short"),
+        ],
+        RunOptions {
+            verbose: 0,
+            tracking: false,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(report.exit_code, 0);
+    assert_eq!(report.filter_name, "git");
+    assert!(report.filtered_bytes <= report.raw_bytes);
 }
