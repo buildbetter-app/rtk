@@ -10,7 +10,9 @@ pub mod learn;
 pub mod parser;
 
 pub(crate) use cli::Commands;
-pub use cli::{run_filtered, run_filtered_with_options, RunOptions};
+pub use cli::{
+    run_filtered, run_filtered_with_options, run_filtered_with_report, RunOptions, RunReport,
+};
 pub(crate) use cmds::dotnet::{binlog, dotnet_format_report, dotnet_trx};
 pub(crate) use cmds::git::git;
 pub(crate) use cmds::go::golangci_cmd;
