@@ -1,3 +1,4 @@
+# Modified by BuildBetter: expose library and binary targets for embedding.
 [package]
 name = "rtk"
 version = "0.45.0"
@@ -11,6 +12,14 @@ repository = "https://github.com/rtk-ai/rtk"
 readme = "README.md"
 keywords = ["cli", "llm", "token", "filter", "productivity"]
 categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "rtk"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rtk"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

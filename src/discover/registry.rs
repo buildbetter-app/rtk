@@ -1,3 +1,4 @@
+// Modified by BuildBetter: parameterize the executable prefix used by command rewrites.
 //! Matches shell commands against known RTK rewrite rules to decide how to handle them.
 
 use crate::core::utils::composer_bin_dirs;
@@ -12,6 +13,59 @@ use super::lexer::{
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
 
 const PHP_TOOL_NAMES: [&str; 6] = ["phpunit", "phpstan", "ecs", "pest", "paratest", "pint"];
+
+/// Executable prefix prepended to commands produced by the rewrite registry.
+///
+/// The default is `rtk`, preserving the standalone CLI's existing behavior. Embedded
+/// consumers can use a multi-word prefix such as `zs proxy`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RewritePrefix(String);
+
+impl RewritePrefix {
+    /// Create a non-empty executable prefix.
+    pub fn new(prefix: impl Into<String>) -> anyhow::Result<Self> {
+        let prefix = prefix.into();
+        let prefix = prefix.trim();
+        anyhow::ensure!(!prefix.is_empty(), "rewrite prefix cannot be empty");
+        anyhow::ensure!(
+            !prefix.chars().any(char::is_control),
+            "rewrite prefix cannot contain control characters"
+        );
+        anyhow::ensure!(
+            tokenize(prefix)
+                .iter()
+                .all(|token| token.kind == TokenKind::Arg),
+            "rewrite prefix cannot contain shell operators or redirects"
+        );
+        Ok(Self(prefix.to_string()))
+    }
+
+    /// Return the configured executable prefix.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn apply(&self, canonical_rtk_command: &str) -> String {
+        if let Some(suffix) = canonical_rtk_command.strip_prefix("rtk") {
+            format!("{}{}", self.0, suffix)
+        } else {
+            canonical_rtk_command.to_string()
+        }
+    }
+
+    fn matches_command(&self, command: &str) -> bool {
+        command == self.0
+            || command
+                .strip_prefix(&self.0)
+                .is_some_and(|suffix| suffix.starts_with(char::is_whitespace))
+    }
+}
+
+impl Default for RewritePrefix {
+    fn default() -> Self {
+        Self("rtk".to_string())
+    }
+}
 
 /// Result of classifying a command.
 #[derive(Debug, PartialEq)]
@@ -571,6 +625,21 @@ pub fn rewrite_command(
     excluded: &[String],
     transparent_prefixes: &[String],
 ) -> Option<String> {
+    rewrite_command_with_prefix(
+        cmd,
+        excluded,
+        transparent_prefixes,
+        &RewritePrefix::default(),
+    )
+}
+
+/// Rewrite a command using a caller-provided executable prefix.
+pub fn rewrite_command_with_prefix(
+    cmd: &str,
+    excluded: &[String],
+    transparent_prefixes: &[String],
+    rewrite_prefix: &RewritePrefix,
+) -> Option<String> {
     // Bash joins `\<NL>` with nothing, so `<<` or `$((` can arrive split across
     // a continuation; the space-join below would erase them (#3188 review).
     if cmd.contains('\\') {
@@ -598,10 +667,10 @@ pub fn rewrite_command(
     let normalized_prefixes = normalize_transparent_prefixes(transparent_prefixes);
 
     if trimmed.contains('\n') {
-        return rewrite_multiline_block(trimmed, &compiled, &normalized_prefixes);
+        return rewrite_multiline_block(trimmed, &compiled, &normalized_prefixes, rewrite_prefix);
     }
 
-    rewrite_single(trimmed, &compiled, &normalized_prefixes)
+    rewrite_single(trimmed, &compiled, &normalized_prefixes, rewrite_prefix)
 }
 
 /// Rewrite one logical command line (no unquoted newlines).
@@ -609,6 +678,7 @@ fn rewrite_single(
     trimmed: &str,
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
+    rewrite_prefix: &RewritePrefix,
 ) -> Option<String> {
     // Simple (non-compound) already-RTK command — return as-is.
     // For compound commands that start with "rtk" (e.g. "rtk git add . && cargo test"),
@@ -618,11 +688,14 @@ fn rewrite_single(
         || trimmed.contains(';')
         || trimmed.contains('|')
         || trimmed.contains(" & ");
-    if !has_compound && (trimmed.starts_with("rtk ") || trimmed == "rtk") {
+    if !has_compound
+        && ((trimmed.starts_with("rtk ") || trimmed == "rtk")
+            || rewrite_prefix.matches_command(trimmed))
+    {
         return Some(trimmed.to_string());
     }
 
-    rewrite_compound(trimmed, excluded, transparent_prefixes)
+    rewrite_compound(trimmed, excluded, transparent_prefixes, rewrite_prefix)
 }
 
 /// Shell keywords that open or close a multi-line construct. A line inside a
@@ -841,6 +914,7 @@ fn rewrite_multiline_block(
     cmd: &str,
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
+    rewrite_prefix: &RewritePrefix,
 ) -> Option<String> {
     let newline_offsets: Vec<usize> = tokenize_with_newlines(cmd)
         .iter()
@@ -860,7 +934,7 @@ fn rewrite_multiline_block(
         // is one logical command (a multi-line commit message), not a hidden
         // extra line; rewrite it whole, as develop always did (#3319 fuzz).
         if newline_offsets.is_empty() && quotes_balanced(cmd) {
-            return rewrite_single(cmd, excluded, transparent_prefixes);
+            return rewrite_single(cmd, excluded, transparent_prefixes, rewrite_prefix);
         }
         return None;
     }
@@ -923,7 +997,7 @@ fn rewrite_multiline_block(
             &cmd[seg_off..last_off + last_seg.len()]
         };
         let line = unit.trim();
-        match rewrite_single(line, excluded, transparent_prefixes) {
+        match rewrite_single(line, excluded, transparent_prefixes, rewrite_prefix) {
             Some(rewritten) if rewritten != line => {
                 any_changed = true;
                 let indent = &seg[..seg.len() - seg.trim_start().len()];
@@ -1010,6 +1084,7 @@ fn rewrite_pipeline_final_stage(
     analysis: PipelineAnalysis,
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
+    rewrite_prefix: &RewritePrefix,
 ) -> Option<String> {
     let final_stage_start = analysis.final_stage_start?;
     let final_stage = cmd[final_stage_start..analysis.end_offset].trim();
@@ -1020,6 +1095,7 @@ fn rewrite_pipeline_final_stage(
         transparent_prefixes,
         RewriteContext::PipelineFinal,
         0,
+        rewrite_prefix,
     )
     .filter(|rewritten| rewritten != final_stage)
     .map(|rewritten| {
@@ -1036,6 +1112,7 @@ fn rewrite_compound(
     cmd: &str,
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
+    rewrite_prefix: &RewritePrefix,
 ) -> Option<String> {
     let tokens = tokenize(cmd);
     let has_pipe = tokens
@@ -1059,8 +1136,9 @@ fn rewrite_compound(
         match tok.kind {
             TokenKind::Operator => {
                 let seg = cmd[seg_start..tok.offset].trim();
-                let rewritten = rewrite_segment(seg, excluded, transparent_prefixes)
-                    .unwrap_or_else(|| seg.to_string());
+                let rewritten =
+                    rewrite_segment(seg, excluded, transparent_prefixes, rewrite_prefix)
+                        .unwrap_or_else(|| seg.to_string());
                 if rewritten != seg {
                     any_changed = true;
                 }
@@ -1090,6 +1168,7 @@ fn rewrite_compound(
                     analysis,
                     excluded,
                     transparent_prefixes,
+                    rewrite_prefix,
                 );
 
                 if let Some(rewritten) = rewritten_pipeline {
@@ -1111,8 +1190,9 @@ fn rewrite_compound(
             }
             TokenKind::Shellism if tok.value == "&" => {
                 let seg = cmd[seg_start..tok.offset].trim();
-                let rewritten = rewrite_segment(seg, excluded, transparent_prefixes)
-                    .unwrap_or_else(|| seg.to_string());
+                let rewritten =
+                    rewrite_segment(seg, excluded, transparent_prefixes, rewrite_prefix)
+                        .unwrap_or_else(|| seg.to_string());
                 if rewritten != seg {
                     any_changed = true;
                 }
@@ -1128,8 +1208,8 @@ fn rewrite_compound(
     }
 
     let seg = cmd[seg_start..].trim();
-    let rewritten =
-        rewrite_segment(seg, excluded, transparent_prefixes).unwrap_or_else(|| seg.to_string());
+    let rewritten = rewrite_segment(seg, excluded, transparent_prefixes, rewrite_prefix)
+        .unwrap_or_else(|| seg.to_string());
     if rewritten != seg {
         any_changed = true;
     }
@@ -1142,12 +1222,17 @@ fn rewrite_compound(
     }
 }
 
-fn rewrite_line_range(cmd: &str) -> Option<String> {
+fn rewrite_line_range(cmd: &str, rewrite_prefix: &RewritePrefix) -> Option<String> {
     for re in [&*HEAD_N, &*HEAD_LINES] {
         if let Some(caps) = re.captures(cmd) {
             let n = caps.get(1)?.as_str();
             let file = caps.get(2)?.as_str();
-            return Some(format!("rtk read {} --max-lines {}", file, n));
+            return Some(format!(
+                "{} read {} --max-lines {}",
+                rewrite_prefix.as_str(),
+                file,
+                n
+            ));
         }
     }
     if cmd.starts_with("head -") {
@@ -1162,7 +1247,12 @@ fn rewrite_line_range(cmd: &str) -> Option<String> {
         if let Some(caps) = re.captures(cmd) {
             let n = caps.get(1)?.as_str();
             let file = caps.get(2)?.as_str();
-            return Some(format!("rtk read {} --tail-lines {}", file, n));
+            return Some(format!(
+                "{} read {} --tail-lines {}",
+                rewrite_prefix.as_str(),
+                file,
+                n
+            ));
         }
     }
     None
@@ -1267,6 +1357,7 @@ fn rewrite_segment(
     seg: &str,
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
+    rewrite_prefix: &RewritePrefix,
 ) -> Option<String> {
     rewrite_segment_inner(
         seg,
@@ -1274,6 +1365,7 @@ fn rewrite_segment(
         transparent_prefixes,
         RewriteContext::Normal,
         0,
+        rewrite_prefix,
     )
 }
 
@@ -1290,6 +1382,7 @@ fn rewrite_segment_inner(
     transparent_prefixes: &[String],
     context: RewriteContext,
     depth: usize,
+    rewrite_prefix: &RewritePrefix,
 ) -> Option<String> {
     let trimmed = seg.trim();
     if trimmed.is_empty() {
@@ -1317,6 +1410,7 @@ fn rewrite_segment_inner(
             transparent_prefixes,
             context,
             depth + 1,
+            rewrite_prefix,
         )?;
         return Some(format!("{}{}", env_prefix, rewritten));
     }
@@ -1326,9 +1420,14 @@ fn rewrite_segment_inner(
             if rest.is_empty() {
                 return None;
             }
-            if let Some(rewritten) =
-                rewrite_segment_inner(rest, excluded, transparent_prefixes, context, depth + 1)
-            {
+            if let Some(rewritten) = rewrite_segment_inner(
+                rest,
+                excluded,
+                transparent_prefixes,
+                context,
+                depth + 1,
+                rewrite_prefix,
+            ) {
                 return Some(format!("{} {}", prefix, rewritten));
             }
             // #2768: falling through re-tests the full prefixed string, which is
@@ -1347,8 +1446,15 @@ fn rewrite_segment_inner(
             if rest.is_empty() {
                 return None;
             }
-            return rewrite_segment_inner(rest, excluded, transparent_prefixes, context, depth + 1)
-                .map(|rewritten| format!("{} {}", prefix, rewritten));
+            return rewrite_segment_inner(
+                rest,
+                excluded,
+                transparent_prefixes,
+                context,
+                depth + 1,
+                rewrite_prefix,
+            )
+            .map(|rewritten| format!("{} {}", prefix, rewritten));
         }
     }
 
@@ -1357,14 +1463,16 @@ fn rewrite_segment_inner(
     let (cmd_part, redirect_suffix) = strip_trailing_redirects(trimmed);
 
     // Already RTK — pass through unchanged
-    if cmd_part.starts_with("rtk ") || cmd_part == "rtk" {
+    if cmd_part.starts_with("rtk ") || cmd_part == "rtk" || rewrite_prefix.matches_command(cmd_part)
+    {
         return Some(trimmed.to_string());
     }
 
     if context == RewriteContext::Normal
         && (cmd_part.starts_with("head -") || cmd_part.starts_with("tail "))
     {
-        return rewrite_line_range(cmd_part).map(|r| format!("{}{}", r, redirect_suffix));
+        return rewrite_line_range(cmd_part, rewrite_prefix)
+            .map(|r| format!("{}{}", r, redirect_suffix));
     }
 
     // Most cat flags (-v, -A, -e, -t, -s, -b, --show-all, etc.) have different
@@ -1404,7 +1512,12 @@ fn rewrite_segment_inner(
                 return None;
             }
             if crate::core::toml_filter::command_matches_filter(&normalized) {
-                return Some(format!("rtk {}{}", cmd_part, redirect_suffix));
+                return Some(format!(
+                    "{} {}{}",
+                    rewrite_prefix.as_str(),
+                    cmd_part,
+                    redirect_suffix
+                ));
             }
             return None;
         }
@@ -1421,11 +1534,17 @@ fn rewrite_segment_inner(
 
     if let Some(parts) = parse_golangci_run_parts(cmd_part) {
         let rewritten = if parts.global_segment.is_empty() {
-            format!("rtk golangci-lint {}", parts.run_segment)
+            format!(
+                "{} golangci-lint {}",
+                rewrite_prefix.as_str(),
+                parts.run_segment
+            )
         } else {
             format!(
-                "rtk golangci-lint {} {}",
-                parts.global_segment, parts.run_segment
+                "{} golangci-lint {} {}",
+                rewrite_prefix.as_str(),
+                parts.global_segment,
+                parts.run_segment
             )
         };
         return Some(rewritten);
@@ -1468,9 +1587,14 @@ fn rewrite_segment_inner(
     for &prefix in rule.rewrite_prefixes {
         if let Some(rest) = strip_word_prefix(strip_target, prefix) {
             let rewritten = if rest.is_empty() {
-                format!("{}{}", rule.rtk_cmd, redirect_suffix)
+                format!("{}{}", rewrite_prefix.apply(rule.rtk_cmd), redirect_suffix)
             } else {
-                format!("{} {}{}", rule.rtk_cmd, rest, redirect_suffix)
+                format!(
+                    "{} {}{}",
+                    rewrite_prefix.apply(rule.rtk_cmd),
+                    rest,
+                    redirect_suffix
+                )
             };
             return Some(rewritten);
         }
@@ -1501,6 +1625,58 @@ mod tests {
 
     fn rewrite_command_no_prefixes(cmd: &str, excluded: &[String]) -> Option<String> {
         super::rewrite_command(cmd, excluded, &[])
+    }
+
+    fn rewrite_with_zs_prefix(cmd: &str) -> Option<String> {
+        let prefix = RewritePrefix::new("zs proxy").unwrap();
+        super::rewrite_command_with_prefix(cmd, &[], &[], &prefix)
+    }
+
+    #[test]
+    fn custom_prefix_rewrites_simple_and_compound_commands() {
+        assert_eq!(
+            rewrite_with_zs_prefix("git status"),
+            Some("zs proxy git status".into())
+        );
+        assert_eq!(
+            rewrite_with_zs_prefix("git add . && cargo test"),
+            Some("zs proxy git add . && zs proxy cargo test".into())
+        );
+    }
+
+    #[test]
+    fn custom_prefix_preserves_env_pipeline_and_line_range_behavior() {
+        assert_eq!(
+            rewrite_with_zs_prefix("GIT_PAGER=cat git status"),
+            Some("GIT_PAGER=cat zs proxy git status".into())
+        );
+        assert_eq!(
+            rewrite_with_zs_prefix("cargo test | grep FAILED"),
+            Some("cargo test | zs proxy grep FAILED".into())
+        );
+        assert_eq!(
+            rewrite_with_zs_prefix("head -10 Cargo.toml"),
+            Some("zs proxy read Cargo.toml --max-lines 10".into())
+        );
+    }
+
+    #[test]
+    fn custom_prefix_preserves_multiline_and_already_rewritten_commands() {
+        assert_eq!(
+            rewrite_with_zs_prefix("git status\ncargo test"),
+            Some("zs proxy git status\nzs proxy cargo test".into())
+        );
+        assert_eq!(
+            rewrite_with_zs_prefix("zs proxy git status"),
+            Some("zs proxy git status".into())
+        );
+    }
+
+    #[test]
+    fn rewrite_prefix_rejects_invalid_values() {
+        assert!(RewritePrefix::new("   ").is_err());
+        assert!(RewritePrefix::new("zs\nproxy").is_err());
+        assert!(RewritePrefix::new("zs proxy; echo unsafe").is_err());
     }
 
     mod multiline_blocks {

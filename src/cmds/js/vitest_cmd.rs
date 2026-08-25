@@ -1,3 +1,4 @@
+// Modified by BuildBetter: reference the shared library CLI command type.
 //! Filters Vitest test output to show only failures.
 
 use anyhow::{Context, Result};
@@ -199,7 +200,7 @@ fn extract_failures_regex(output: &str) -> Vec<TestFailure> {
     failures
 }
 
-pub fn run_test(command: &Commands, args: &[String], verbose: u8) -> Result<i32> {
+pub(crate) fn run_test(command: &Commands, args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
     let mut passthrough_requested = false;
 

@@ -1,5 +1,36 @@
+// Modified by BuildBetter: allow embedded calls to provide their original argv.
 //! Utility functions for argument handling, particularly for restoring "--" escape
 //! arguments that clap consumes during parsing.
+
+use std::cell::RefCell;
+use std::ffi::OsString;
+
+thread_local! {
+    static RAW_ARGS_OVERRIDE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+struct RawArgsGuard(Option<Vec<String>>);
+
+impl Drop for RawArgsGuard {
+    fn drop(&mut self) {
+        RAW_ARGS_OVERRIDE.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
+pub(crate) fn with_raw_args<F, T>(raw_args: &[OsString], f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    let raw_args = raw_args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let previous = RAW_ARGS_OVERRIDE.with(|slot| slot.replace(Some(raw_args)));
+    let _guard = RawArgsGuard(previous);
+    f()
+}
 
 /// Restores `--` tokens that clap consumed when using `trailing_var_arg = true`.
 ///
@@ -7,7 +38,9 @@
 /// than `parsed_args` (nothing was consumed). Otherwise restores all consumed `--` at
 /// their original positions by returning the user-args suffix of `raw_args` verbatim.
 pub fn restore_double_dash(parsed_args: &[String]) -> Vec<String> {
-    let raw_args: Vec<String> = std::env::args().collect();
+    let raw_args = RAW_ARGS_OVERRIDE
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_else(|| std::env::args().collect());
     restore_double_dash_with_raw(parsed_args, &raw_args)
 }
 
@@ -49,6 +82,19 @@ mod tests {
         let parsed: Vec<String> = parsed.iter().map(|s| s.to_string()).collect();
         let raw: Vec<String> = raw.iter().map(|s| s.to_string()).collect();
         restore_double_dash_with_raw(parsed.as_slice(), raw.as_slice())
+    }
+
+    #[test]
+    fn scoped_raw_args_override_process_args() {
+        let raw = [
+            OsString::from("rtk"),
+            OsString::from("git"),
+            OsString::from("diff"),
+            OsString::from("--"),
+            OsString::from("file"),
+        ];
+        let restored = with_raw_args(&raw, || restore_double_dash(&["file".to_string()]));
+        assert_eq!(restored, vec!["--", "file"]);
     }
 
     // ============ Single "--" swallowed ============
