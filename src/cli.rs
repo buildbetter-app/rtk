@@ -1599,7 +1599,7 @@ pub fn run_cli() -> Result<i32> {
         }
     };
 
-    dispatch(cli)
+    dispatch(cli, true)
 }
 
 /// Execute one original command argv through RTK's normal filtering dispatch.
@@ -1612,6 +1612,7 @@ pub fn run_filtered(argv: &[OsString], verbose: u8) -> Result<i32> {
         RunOptions {
             verbose,
             tracking: true,
+            hook_warning: true,
         },
     )
 }
@@ -1623,6 +1624,9 @@ pub struct RunOptions {
     pub verbose: u8,
     /// Whether RTK should record this execution in its SQLite savings ledger.
     pub tracking: bool,
+    /// Whether to print the once-a-day "hook missing or outdated" warning.
+    /// Embedding hosts manage their own hooks and must not show RTK's advice.
+    pub hook_warning: bool,
 }
 
 impl Default for RunOptions {
@@ -1630,6 +1634,7 @@ impl Default for RunOptions {
         Self {
             verbose: 0,
             tracking: true,
+            hook_warning: true,
         }
     }
 }
@@ -1692,7 +1697,7 @@ fn run_filtered_dispatch(argv: &[OsString], options: RunOptions) -> Result<i32> 
             }
         };
         cli.verbose = options.verbose;
-        dispatch(cli)
+        dispatch(cli, options.hook_warning)
     };
 
     let run_with_argv = || core::args_utils::with_raw_args(&parse_args, run);
@@ -1703,10 +1708,11 @@ fn run_filtered_dispatch(argv: &[OsString], options: RunOptions) -> Result<i32> 
     }
 }
 
-fn dispatch(cli: Cli) -> Result<i32> {
+fn dispatch(cli: Cli, hook_warning: bool) -> Result<i32> {
     // Warn if installed hook is outdated/missing (1/day, non-blocking).
-    // Skip for Gain — it shows its own inline hook warning.
-    if !matches!(cli.command, Commands::Gain { .. }) {
+    // Skip for Gain — it shows its own inline hook warning. Embedding hosts
+    // pass `hook_warning = false` because they manage hooks themselves.
+    if hook_warning && !matches!(cli.command, Commands::Gain { .. }) {
         hooks::hook_check::maybe_warn();
     }
 
@@ -3757,6 +3763,7 @@ fn embedded_unknown_command_uses_supplied_argv_without_tracking() {
         RunOptions {
             verbose: 0,
             tracking: false,
+            hook_warning: true,
         },
     )
     .unwrap();
@@ -3775,6 +3782,7 @@ fn embedded_git_command_returns_run_report() {
         RunOptions {
             verbose: 0,
             tracking: false,
+            hook_warning: true,
         },
     )
     .unwrap();
